@@ -1,0 +1,22 @@
+name: Build macOS app
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: macos-14
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Build debug executable
+        run: swift build
+
+      - name: Build release app bundle
+        run: scripts/build-app.sh
+
+      - name: Validate app metadata
+        run: plutil -lint outputs/ClaudeSessionManager.app/Contents/Info.plist
