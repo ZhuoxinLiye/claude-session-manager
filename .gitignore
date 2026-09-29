@@ -1,0 +1,19 @@
+# Swift / Xcode build output
+.build/
+.swiftpm/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+
+# Local application bundles and generated previews
+dist/
+outputs/
+work/
+
+# macOS metadata
+.DS_Store
+
+# Editor and local tooling state
+.vscode/
+.idea/
+
