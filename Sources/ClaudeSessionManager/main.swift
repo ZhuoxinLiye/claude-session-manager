@@ -897,8 +897,18 @@ enum GhosttyBridgeError: LocalizedError {
     }
 }
 
+enum GhosttyTabOpenResult {
+    case created
+    case reused
+}
+
 struct GhosttyBridge {
-    func openAttachTab(server: ServerProfile, tmuxName: String, title: String) throws {
+    func openAttachTab(
+        server: ServerProfile,
+        tmuxName: String,
+        title: String,
+        sessionID: String? = nil
+    ) throws -> GhosttyTabOpenResult {
         let remote = "tmux attach-session -t \(ShellQuoting.singleQuote(tmuxName))"
         // Many servers do not have Ghostty's xterm-ghostty terminfo entry yet.
         // Keep Ghostty unchanged locally, but send a widely available TERM value
@@ -907,9 +917,52 @@ struct GhosttyBridge {
         let cleanTitle = title
             .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let action = "set_tab_title:\(String(cleanTitle.prefix(80)))"
+        let visibleTitle = String((cleanTitle.isEmpty ? "Claude 对话" : cleanTitle).prefix(80))
+        let markerIdentity: String
+        if let sessionID, !sessionID.isEmpty {
+            markerIdentity = "session:\(sessionID.lowercased())"
+        } else {
+            // Old untagged tmux sessions may not expose a Claude session ID.
+            // Including the SSH target keeps those fallback markers local to one profile.
+            markerIdentity = "tmux:\(server.sshTarget.lowercased()):\(tmuxName)"
+        }
+        let marker = tabMarker(for: markerIdentity)
+        let action = "set_tab_title:\(visibleTitle)\(marker)"
+        let markerLiteral = appleScriptString(marker)
+        let visibleTitleLiteral = appleScriptString(visibleTitle)
         let script = """
         tell application "Ghostty"
+            -- A tab created by this app carries an invisible stable marker in its title.
+            -- Select it instead of creating a second SSH client for the same tmux session.
+            repeat with windowItem in windows
+                repeat with tabItem in tabs of windowItem
+                    try
+                        set candidateTitle to name of tabItem
+                        if candidateTitle contains \(markerLiteral) then
+                            select tab tabItem
+                            focus (focused terminal of tabItem)
+                            perform action \(appleScriptString(action)) on focused terminal of tabItem
+                            return "reused"
+                        end if
+                    end try
+                end repeat
+            end repeat
+
+            -- Tabs created by versions before the marker was introduced only have the
+            -- visible title. Reuse the first exact match as a compatibility fallback.
+            repeat with windowItem in windows
+                repeat with tabItem in tabs of windowItem
+                    try
+                        if (name of tabItem) is \(visibleTitleLiteral) then
+                            select tab tabItem
+                            focus (focused terminal of tabItem)
+                            perform action \(appleScriptString(action)) on focused terminal of tabItem
+                            return "reused"
+                        end if
+                    end try
+                end repeat
+            end repeat
+
             set configuration to new surface configuration
             set command of configuration to \(appleScriptString(command))
             if (count of windows) > 0 then
@@ -920,6 +973,8 @@ struct GhosttyBridge {
             end if
             perform action \(appleScriptString(action)) on focused terminal of createdTab
             select tab createdTab
+            focus (focused terminal of createdTab)
+            return "created"
         end tell
         """
 
@@ -928,6 +983,79 @@ struct GhosttyBridge {
             let detail = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
             throw GhosttyBridgeError.unavailable(detail.isEmpty ? "无法通过 AppleScript 打开 Ghostty。" : detail)
         }
+        return result.stdout.trimmingCharacters(in: .whitespacesAndNewlines) == "reused" ? .reused : .created
+    }
+
+    private func tabMarker(for identity: String) -> String {
+        let digest = SHA256.hash(data: Data(identity.utf8))
+        // Two invisible code points encode one bit. Twelve digest bytes keep the
+        // marker short while making collisions impractical for local tabs.
+        var bits = ""
+        for byte in digest.prefix(12) {
+            for shift in 0..<8 {
+                bits.append(((byte >> (7 - shift)) & 1) == 0 ? "\u{200B}" : "\u{200C}")
+            }
+        }
+        return "\u{2063}\u{2062}" + bits + "\u{2062}\u{2063}"
+    }
+
+    @discardableResult
+    func updateExistingTab(
+        sessionID: String,
+        title: String,
+        previousTitle: String? = nil
+    ) throws -> Bool {
+        guard !sessionID.isEmpty else { return false }
+        let cleanTitle = title
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let visibleTitle = String((cleanTitle.isEmpty ? "Claude 对话" : cleanTitle).prefix(80))
+        let marker = tabMarker(for: "session:\(sessionID.lowercased())")
+        let action = "set_tab_title:\(visibleTitle)\(marker)"
+        let markerLiteral = appleScriptString(marker)
+        let previousMatch: String
+        if let previousTitle {
+            let oldTitle = previousTitle
+                .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let oldVisibleTitle = String((oldTitle.isEmpty ? "Claude 对话" : oldTitle).prefix(80))
+            previousMatch = """
+            repeat with windowItem in windows
+                repeat with tabItem in tabs of windowItem
+                    try
+                        if (name of tabItem) is \(appleScriptString(oldVisibleTitle)) then
+                            perform action \(appleScriptString(action)) on focused terminal of tabItem
+                            return "updated"
+                        end if
+                    end try
+                end repeat
+            end repeat
+            """
+        } else {
+            previousMatch = ""
+        }
+        let script = """
+        tell application "Ghostty"
+            repeat with windowItem in windows
+                repeat with tabItem in tabs of windowItem
+                    try
+                        if (name of tabItem) contains \(markerLiteral) then
+                            perform action \(appleScriptString(action)) on focused terminal of tabItem
+                            return "updated"
+                        end if
+                    end try
+                end repeat
+            end repeat
+            \(previousMatch)
+            return "missing"
+        end tell
+        """
+        let result = try ProcessRunner.run("/usr/bin/osascript", arguments: ["-e", script])
+        guard result.status == 0 else {
+            let detail = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+            throw GhosttyBridgeError.unavailable(detail.isEmpty ? "无法更新 Ghostty tab 标题。" : detail)
+        }
+        return result.stdout.trimmingCharacters(in: .whitespacesAndNewlines) == "updated"
     }
 
     private func appleScriptString(_ value: String) -> String {
@@ -1044,6 +1172,11 @@ final class AppState: ObservableObject {
                 }.value
                 let renamed = conversation.renamed(to: title)
                 replaceConversation(renamed)
+                _ = try? ghostty.updateExistingTab(
+                    sessionID: conversation.sessionID,
+                    title: title,
+                    previousTitle: conversation.title
+                )
                 statusMessage = "已重命名：\(title)"
                 await refreshSelectedServer()
             } catch {
@@ -1091,12 +1224,18 @@ final class AppState: ObservableObject {
                         try SSHClient(server: server).renameConversation(newConversation, to: title)
                     }.value
                 }
-                try ghostty.openAttachTab(
+                let tabResult = try ghostty.openAttachTab(
                     server: server,
                     tmuxName: tmuxName,
-                    title: title ?? "新建 Claude 对话"
+                    title: title ?? "新建 Claude 对话",
+                    sessionID: sessionID
                 )
-                statusMessage = title.map { "已在 Ghostty 中打开：\($0)" } ?? "已在 Ghostty 中打开新对话"
+                switch tabResult {
+                case .created:
+                    statusMessage = title.map { "已在 Ghostty 中打开：\($0)" } ?? "已在 Ghostty 中打开新对话"
+                case .reused:
+                    statusMessage = title.map { "已切换到已打开的 Ghostty tab：\($0)" } ?? "已切换到已打开的新对话"
+                }
                 await refreshSelectedServer()
             } catch {
                 lastError = error.localizedDescription
@@ -1266,9 +1405,16 @@ final class AppState: ObservableObject {
                         additionalLegacyNames: legacyNames
                     )
                 }.value
-                try ghostty.openAttachTab(server: server, tmuxName: tmuxName, title: conversation.title)
+                let tabResult = try ghostty.openAttachTab(
+                    server: server,
+                    tmuxName: tmuxName,
+                    title: conversation.title,
+                    sessionID: conversation.sessionID
+                )
                 selectedConversationID = conversation.id
-                statusMessage = "已在 Ghostty 中打开：\(conversation.title)"
+                statusMessage = tabResult == .reused
+                    ? "已切换到已打开的 Ghostty tab：\(conversation.title)"
+                    : "已在 Ghostty 中打开：\(conversation.title)"
                 await refreshSelectedServer()
             } catch {
                 lastError = error.localizedDescription
@@ -1281,8 +1427,15 @@ final class AppState: ObservableObject {
         guard let server = selectedServer else { return }
         do {
             let title = title(for: session)
-            try ghostty.openAttachTab(server: server, tmuxName: session.name, title: title)
-            statusMessage = "已重新连接 \(title)"
+            let tabResult = try ghostty.openAttachTab(
+                server: server,
+                tmuxName: session.name,
+                title: title,
+                sessionID: session.sessionID
+            )
+            statusMessage = tabResult == .reused
+                ? "已切换到已打开的 Ghostty tab：\(title)"
+                : "已重新连接 \(title)"
         } catch {
             lastError = error.localizedDescription
         }

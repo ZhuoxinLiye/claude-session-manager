@@ -24,12 +24,12 @@ The project is macOS-first and intentionally uses the system OpenSSH client inst
 - Reads `~/.claude/history.jsonl` by default.
 - Falls back to scanning `~/.claude/projects/**/*.jsonl` when the history index is absent.
 - Maps one Claude session ID to one managed tmux session on the remote host. The visible tmux name is `cc-<title-slug>-<session-hash>`; the session hash keeps equal titles collision-free.
-- Uses Ghostty's AppleScript dictionary to open a new tab and attach to tmux.
-- Sets the Ghostty tab title to the selected Claude conversation title and keeps that title override after remote terminal updates.
+- Uses Ghostty's AppleScript dictionary to open a tab and attach to tmux. Before creating one, it scans existing Ghostty tabs and selects the tab already associated with that Claude session.
+- Sets the Ghostty tab title to the selected Claude conversation title and keeps that title override after remote terminal updates. A short invisible marker in the title lets the app recognize the tab without displaying an internal ID.
 - Closing the Ghostty tab only detaches SSH; the tmux session remains.
 - The sidebar can reattach to active sessions or explicitly end them.
 - Active tmux entries use the matching Claude conversation title as their primary label. If the history no longer contains a session, the deterministic internal tmux name is shown as a fallback.
-- A pencil action or the conversation context menu changes a title. The app appends Claude Code's `custom-title` transcript event, updates the tmux title metadata, and migrates the tmux name.
+- A pencil action or the conversation context menu changes a title. The app appends Claude Code's `custom-title` transcript event, updates the tmux title metadata and open Ghostty tab, and migrates the tmux name.
 - The current server view can create a new Claude session with an optional title and remote project path. New sessions use `claude --session-id` and an ASCII-safe `--name` seed, then append the exact app title as Claude's `custom-title` event before opening a new Ghostty tab.
 - Managed tmux sessions carry `@ccsm_session_id`, `@ccsm_project`, and `@ccsm_title` user options. These options let the app find a session by Claude session ID even after a title change or an SSH alias change.
 - Ships with a native macOS icon generated from the terminal conversation mark in `Resources/AppIcon.icns`.
@@ -38,7 +38,7 @@ The project is macOS-first and intentionally uses the system OpenSSH client inst
 
 - macOS 14 or newer
 - Swift 5.9 or newer, or the macOS Command Line Tools
-- [Ghostty](https://ghostty.org/) installed locally
+- [Ghostty](https://ghostty.org/) 1.3.0 or newer installed locally (the AppleScript API was introduced in 1.3.0)
 - `tmux` and `claude` installed on each remote host
 - A Claude Code version that supports `--session-id`, `--name`, and the `custom-title` session event
 - SSH access configured for each host, preferably through `~/.ssh/config`
@@ -71,7 +71,7 @@ The generated app bundle is written to `outputs/ClaudeSessionManager.app`. Build
 - `SSHClient` runs non-interactive inspection commands over OpenSSH and lists only the selected host.
 - `ClaudeHistoryAdapter` parses `~/.claude/history.jsonl`, with a fallback scan of `~/.claude/projects/**/*.jsonl`.
 - `LocalStore` caches history signatures and parsed conversations under `~/Library/Application Support/ClaudeSessionManager/`.
-- `GhosttyBridge` opens a new Ghostty tab and attaches to the managed tmux session for the selected conversation.
+- `GhosttyBridge` finds or creates a Ghostty tab and attaches to the managed tmux session for the selected conversation. Its session marker is derived from the Claude session ID, so title changes do not create another tab.
 
 No telemetry or cloud service is required. Remote history is fetched only after a host is selected or refreshed.
 
@@ -83,6 +83,8 @@ Older releases used a hash of the local server profile ID, SSH target, project p
 
 If duplicate sessions already exist, the refresh warning lists every duplicate so that the stale entry can be ended from the active tmux panel. The app does not automatically kill a session because it cannot infer which attached terminal the user wants to keep. A duplicate without `@ccsm_session_id` may come from an older app release or from a manually created `cc-*` tmux session and has to be inspected before ending.
 
+Ghostty tabs created before the session marker was introduced do not carry the marker. When there is no marker, the app reuses the first tab whose visible title exactly matches the conversation title; opening a new tab is fully deterministic for tabs created by the current release.
+
 ## Contributing
 
 Issues and pull requests are welcome. Please include the macOS version, Swift version, remote shell, Claude Code version, and a redacted reproduction when reporting SSH or history parsing problems.
@@ -91,7 +93,7 @@ Issues and pull requests are welcome. Please include the macOS version, Swift ve
 
 - The history adapter is intentionally tolerant and currently uses the fields commonly present in Claude Code JSONL (`sessionId`, `display`, `project`/`cwd`, and timestamps). Title metadata is read from `custom-title`, `ai-title`, and `agent-name` events.
 - The exact Claude Code version on each server may require a small adapter adjustment.
-- Ghostty automation is currently implemented through its scripting dictionary. The app prefers a new tab in the front window and falls back to a new window when Ghostty has no open window.
+- Ghostty automation is currently implemented through its scripting dictionary. The app prefers an existing matching tab, otherwise creates a tab in the front window and falls back to a new window when Ghostty has no open window.
 - Title editing writes Claude Code's JSONL transcript event directly. This is the format used by Claude Code today; a future Claude Code release could change its internal event schema.
 - mosh transport is reserved for a later iteration; the current MVP uses OpenSSH plus tmux.
 
