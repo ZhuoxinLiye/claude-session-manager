@@ -24,6 +24,11 @@ struct ServerProfile: Codable, Identifiable, Hashable {
     }
 }
 
+enum ConversationTitleSource: String, Codable, Hashable {
+    case inferred
+    case custom
+}
+
 struct Conversation: Identifiable, Hashable, Codable {
     let id: String
     let serverID: UUID
@@ -31,14 +36,146 @@ struct Conversation: Identifiable, Hashable, Codable {
     let sshTarget: String
     let sessionID: String
     let projectPath: String
-    let title: String
+    var title: String
+    var titleSource: ConversationTitleSource
     let updatedAt: Date?
     let source: String
 
+    init(
+        id: String,
+        serverID: UUID,
+        serverName: String,
+        sshTarget: String,
+        sessionID: String,
+        projectPath: String,
+        title: String,
+        titleSource: ConversationTitleSource = .inferred,
+        updatedAt: Date?,
+        source: String
+    ) {
+        self.id = id
+        self.serverID = serverID
+        self.serverName = serverName
+        self.sshTarget = sshTarget
+        self.sessionID = sessionID
+        self.projectPath = projectPath
+        self.title = title
+        self.titleSource = titleSource
+        self.updatedAt = updatedAt
+        self.source = source
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, serverID, serverName, sshTarget, sessionID, projectPath, title
+        case titleSource, updatedAt, source
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        serverID = try container.decode(UUID.self, forKey: .serverID)
+        serverName = try container.decode(String.self, forKey: .serverName)
+        sshTarget = try container.decode(String.self, forKey: .sshTarget)
+        sessionID = try container.decode(String.self, forKey: .sessionID)
+        projectPath = try container.decode(String.self, forKey: .projectPath)
+        title = try container.decode(String.self, forKey: .title)
+        titleSource = try container.decodeIfPresent(ConversationTitleSource.self, forKey: .titleSource) ?? .inferred
+        updatedAt = try container.decodeIfPresent(Date.self, forKey: .updatedAt)
+        source = try container.decode(String.self, forKey: .source)
+    }
+
     var tmuxName: String {
+        Self.preferredTmuxName(title: title, sessionID: sessionID)
+    }
+
+    static func stableTmuxName(forSessionID sessionID: String) -> String {
+        // The session ID is the stable identity on one remote tmux server.
+        // This name is used as a collision-free fallback and as migration key.
+        let input = sessionID.lowercased()
+        let digest = SHA256.hash(data: Data(input.utf8))
+        return "cc-" + digest.map { String(format: "%02x", $0) }.joined().prefix(18)
+    }
+
+    static func lockName(forSessionID sessionID: String) -> String {
+        "ccsm-lock-" + String(stableTmuxName(forSessionID: sessionID).dropFirst(3))
+    }
+
+    static func preferredTmuxName(title: String, sessionID: String) -> String {
+        let digest = SHA256.hash(data: Data(sessionID.lowercased().utf8))
+        let suffix = digest.map { String(format: "%02x", $0) }.joined().prefix(8)
+        let slug = titleSlug(title)
+        return "cc-\(slug)-\(suffix)"
+    }
+
+    static func claudeCLIName(for title: String) -> String? {
+        let ascii = title.unicodeScalars.map { scalar -> Character in
+            if (scalar.value >= 48 && scalar.value <= 57)
+                || (scalar.value >= 65 && scalar.value <= 90)
+                || (scalar.value >= 97 && scalar.value <= 122)
+                || scalar.value == 45 || scalar.value == 95 {
+                return Character(String(scalar))
+            }
+            return "-"
+        }
+        let candidate = String(ascii)
+            .replacingOccurrences(of: "-+", with: "-", options: .regularExpression)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "-_"))
+        guard !candidate.isEmpty else { return nil }
+        return String(candidate.prefix(64))
+    }
+
+    private static func titleSlug(_ title: String) -> String {
+        let normalized = title
+            .replacingOccurrences(of: "\\s+", with: "-", options: .regularExpression)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        var result = ""
+        var lastWasSeparator = false
+        for scalar in normalized.unicodeScalars {
+            if CharacterSet.alphanumerics.contains(scalar) {
+                result.append(String(scalar))
+                lastWasSeparator = false
+            } else if !lastWasSeparator {
+                result.append("-")
+                lastWasSeparator = true
+            }
+        }
+        let trimmed = result.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        return String((trimmed.isEmpty ? "session" : trimmed).prefix(48))
+    }
+
+    static func legacyTmuxName(
+        serverID: UUID,
+        sshTarget: String,
+        projectPath: String,
+        sessionID: String
+    ) -> String {
         let input = "\(serverID.uuidString)|\(sshTarget)|\(projectPath)|\(sessionID)"
         let digest = SHA256.hash(data: Data(input.utf8))
         return "cc-" + digest.map { String(format: "%02x", $0) }.joined().prefix(18)
+    }
+
+    var legacyTmuxName: String {
+        Self.legacyTmuxName(
+            serverID: serverID,
+            sshTarget: sshTarget,
+            projectPath: projectPath,
+            sessionID: sessionID
+        )
+    }
+
+    func renamed(to newTitle: String) -> Conversation {
+        Conversation(
+            id: id,
+            serverID: serverID,
+            serverName: serverName,
+            sshTarget: sshTarget,
+            sessionID: sessionID,
+            projectPath: projectPath,
+            title: newTitle,
+            titleSource: .custom,
+            updatedAt: updatedAt,
+            source: source
+        )
     }
 }
 
@@ -49,6 +186,8 @@ struct ActiveSession: Identifiable, Hashable {
     let name: String
     let attachedClients: Int
     let created: String
+    let sessionID: String?
+    let title: String?
 }
 
 struct RemoteHistoryResult {
@@ -307,7 +446,18 @@ struct SSHClient {
     func readHistory() throws -> String {
         let path = ShellQuoting.remotePath(server.historyPath)
         let fallback = "find \"$HOME/.claude/projects\" -type f -name '*.jsonl' -print0 2>/dev/null | xargs -0 cat 2>/dev/null || true"
-        return try execute("if [ -f \(path) ]; then cat \(path); else \(fallback); fi")
+        let titleEvents = "find \"$HOME/.claude/projects\" -type f -name '*.jsonl' -print0 | xargs -0 grep -hE '\"type\"[[:space:]]*:[[:space:]]*\"(custom-title|ai-title|agent-name)\"' 2>/dev/null || true"
+        return try execute("if [ -f \(path) ]; then cat \(path); printf '\\n'; \(titleEvents); else \(fallback); fi")
+    }
+
+    func readSessionMetadata(for sessionIDs: [String]) throws -> String {
+        let safeIDs = sessionIDs.filter { !$0.isEmpty && !$0.contains("'") }
+        guard !safeIDs.isEmpty else { return "" }
+        let nameExpression = safeIDs
+            .map { "-name \(ShellQuoting.singleQuote("\($0).jsonl"))" }
+            .joined(separator: " -o ")
+        let command = "find \"$HOME/.claude/projects\" -type f \\( \(nameExpression) \\) -print0 | xargs -0 grep -hE '\"type\"[[:space:]]*:[[:space:]]*\"(custom-title|ai-title|agent-name)\"' 2>/dev/null || true"
+        return try execute(command)
     }
 
     func historySignature() throws -> RemoteFileSignature? {
@@ -331,32 +481,183 @@ struct SSHClient {
     }
 
     func listSessions() throws -> [ActiveSession] {
-        let format = ShellQuoting.singleQuote("#{session_name}\t#{session_attached}\t#{session_created_string}")
+        let format = ShellQuoting.singleQuote("#{session_name}\t#{session_attached}\t#{session_created_string}\t#{@ccsm_session_id}\t#{@ccsm_title}")
         let output = try execute("tmux list-sessions -F \(format) 2>/dev/null || true")
         return output
             .split(whereSeparator: \ .isNewline)
             .compactMap { line in
                 let fields = line.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
-                guard fields.count >= 3, fields[0].hasPrefix("cc-") else { return nil }
+                guard fields.count >= 5, fields[0].hasPrefix("cc-") else { return nil }
                 return ActiveSession(
                     id: fields[0],
                     serverID: server.id,
                     serverName: server.name,
                     name: fields[0],
                     attachedClients: Int(fields[1]) ?? 0,
-                    created: fields[2]
+                    created: fields[2],
+                    sessionID: fields[3].isEmpty ? nil : fields[3],
+                    title: fields[4].isEmpty ? nil : fields[4]
                 )
             }
     }
 
-    func ensureSession(for conversation: Conversation) throws {
-        let session = ShellQuoting.singleQuote(conversation.tmuxName)
-        let project = ShellQuoting.remotePath(conversation.projectPath)
-        let claudeSession = ShellQuoting.singleQuote(conversation.sessionID)
-        let launch = "exec claude --resume \(claudeSession)"
+    func ensureSession(
+        for conversation: Conversation,
+        additionalLegacyNames: [String] = []
+    ) throws -> String {
+        let legacyNames = ([conversation.legacyTmuxName, Conversation.stableTmuxName(forSessionID: conversation.sessionID)] + additionalLegacyNames)
+            .filter { !$0.isEmpty }
+            .reduce(into: [String]()) { names, value in
+                if !names.contains(value) {
+                    names.append(value)
+                }
+            }
+        return try ensureManagedSession(
+            name: conversation.tmuxName,
+            legacyNames: legacyNames,
+            sessionID: conversation.sessionID,
+            title: conversation.title,
+            projectPath: conversation.projectPath,
+            launch: resumeCommand(for: conversation)
+        )
+    }
+
+    private func resumeCommand(for conversation: Conversation) -> String {
+        "exec claude --resume \(ShellQuoting.singleQuote(conversation.sessionID))"
+    }
+
+    func startSession(sessionID: String, title: String?, projectPath: String) throws -> String {
+        let launch: String
+        if let title, let cliName = Conversation.claudeCLIName(for: title) {
+            launch = "exec claude --session-id \(ShellQuoting.singleQuote(sessionID)) --name \(ShellQuoting.singleQuote(cliName))"
+        } else {
+            launch = "exec claude --session-id \(ShellQuoting.singleQuote(sessionID))"
+        }
+        return try ensureManagedSession(
+            name: title.map { Conversation.preferredTmuxName(title: $0, sessionID: sessionID) }
+                ?? Conversation.stableTmuxName(forSessionID: sessionID),
+            legacyNames: [],
+            sessionID: sessionID,
+            title: title,
+            projectPath: projectPath,
+            launch: launch
+        )
+    }
+
+    private func ensureManagedSession(
+        name: String,
+        legacyNames: [String],
+        sessionID: String,
+        title: String?,
+        projectPath: String,
+        launch: String
+    ) throws -> String {
+        let session = ShellQuoting.singleQuote(name)
+        let project = ShellQuoting.remotePath(projectPath)
         let command = "cd -- \(project) && exec ${SHELL:-/bin/sh} -lic \(ShellQuoting.singleQuote(launch))"
         let quotedCommand = ShellQuoting.singleQuote(command)
-        _ = try execute("tmux has-session -t \(session) 2>/dev/null || tmux new-session -d -s \(session) \(quotedCommand)")
+        let titleOption = title.map(ShellQuoting.singleQuote) ?? "''"
+        let lock = ShellQuoting.singleQuote(Conversation.lockName(forSessionID: sessionID))
+        let expectedID = ShellQuoting.singleQuote(sessionID)
+        let legacyCase = legacyNames
+            .filter { !$0.isEmpty && $0 != name }
+            .map { ShellQuoting.singleQuote($0) }
+            .joined(separator: "|")
+        let legacyCasePattern = legacyCase.isEmpty ? "__never_legacy_name__" : legacyCase
+        let legacyLookup = legacyNames
+            .filter { !$0.isEmpty && $0 != name }
+            .map { legacyName in
+                "if tmux has-session -t \(ShellQuoting.singleQuote(legacyName)) 2>/dev/null; then tmux rename-session -t \(ShellQuoting.singleQuote(legacyName)) \(session) 2>/dev/null || true; fi"
+            }
+            .joined(separator: "\n")
+        let legacyLookupCommand = legacyLookup.isEmpty ? ":" : legacyLookup
+        let commandLine = """
+        lock_name=\(lock)
+        tmux wait-for -L "$lock_name"
+        release_lock() {
+            tmux wait-for -U "$lock_name" 2>/dev/null || true
+        }
+        trap release_lock EXIT
+        session_name=\(session)
+        expected_id=\(expectedID)
+        if tmux has-session -t "$session_name" 2>/dev/null; then
+            current_id=$(tmux display-message -p -t "$session_name" '#{@ccsm_session_id}' 2>/dev/null || true)
+            if [ -n "$current_id" ] && [ "$current_id" != "$expected_id" ]; then
+                printf 'tmux 会话名已被另一个 Claude session 占用：%s\\n' "$session_name" >&2
+                exit 17
+            fi
+            case "$session_name" in
+                \(legacyCasePattern)) legacy_name=1 ;;
+                *) legacy_name=0 ;;
+            esac
+            if [ -z "$current_id" ] && [ "$legacy_name" -eq 0 ]; then
+                printf 'tmux 会话名已被未标记的会话占用：%s\\n' "$session_name" >&2
+                exit 17
+            fi
+        fi
+        if ! tmux has-session -t \"$session_name\" 2>/dev/null; then
+            existing=$(tmux list-sessions -F '#{session_name}\\t#{@ccsm_session_id}' 2>/dev/null | awk -F '\\t' -v id=\(ShellQuoting.singleQuote(sessionID)) '$2 == id {print $1; exit}')
+            if [ -n \"$existing\" ]; then
+                tmux rename-session -t \"$existing\" \"$session_name\" 2>/dev/null || session_name=\"$existing\"
+            else
+                \(legacyLookupCommand)
+                if ! tmux has-session -t \"$session_name\" 2>/dev/null; then
+                    tmux new-session -d -s \"$session_name\" \(quotedCommand) 2>/dev/null || tmux has-session -t \"$session_name\" 2>/dev/null || exit 1
+                fi
+            fi
+        fi
+        tmux set-option -t \"$session_name\" @ccsm_session_id \(ShellQuoting.singleQuote(sessionID))
+        tmux set-option -t \"$session_name\" @ccsm_project \(ShellQuoting.singleQuote(projectPath))
+        tmux set-option -t \"$session_name\" @ccsm_title \(titleOption)
+        printf '%s' \"$session_name\"
+        """
+        return try execute(commandLine).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    func renameConversation(_ conversation: Conversation, to title: String) throws {
+        let transcriptName = ShellQuoting.singleQuote("\(conversation.sessionID).jsonl")
+        let json = try JSONSerialization.data(withJSONObject: [
+            "type": "custom-title",
+            "customTitle": title,
+            "sessionId": conversation.sessionID
+        ], options: [.sortedKeys])
+        guard let line = String(data: json, encoding: .utf8) else {
+            throw SSHError.commandFailed("无法生成 Claude 标题记录")
+        }
+        let quotedLine = ShellQuoting.singleQuote(line)
+        let newTmuxName = conversation.renamed(to: title).tmuxName
+        let lock = ShellQuoting.singleQuote(Conversation.lockName(forSessionID: conversation.sessionID))
+        let command = """
+        lock_name=\(lock)
+        tmux wait-for -L "$lock_name"
+        release_lock() {
+            tmux wait-for -U "$lock_name" 2>/dev/null || true
+        }
+        trap release_lock EXIT
+        transcript=''
+        attempt=0
+        while [ -z \"$transcript\" ] && [ \"$attempt\" -lt 50 ]; do
+            transcript=$(find \"$HOME/.claude/projects\" -type f -name \(transcriptName) -print -quit)
+            if [ -z \"$transcript\" ]; then
+                sleep 0.1
+            fi
+            attempt=$((attempt + 1))
+        done
+        if [ -z \"$transcript\" ]; then
+            exit 3
+        fi
+        printf '%s\\n' \(quotedLine) >> \"$transcript\"
+        existing=$(tmux list-sessions -F '#{session_name}\\t#{@ccsm_session_id}' 2>/dev/null | awk -F '\\t' -v id=\(ShellQuoting.singleQuote(conversation.sessionID)) '$2 == id {print $1; exit}')
+        if [ -n \"$existing\" ]; then
+            session_name=\"$existing\"
+            if tmux rename-session -t \"$session_name\" \(ShellQuoting.singleQuote(newTmuxName)) 2>/dev/null; then
+                session_name=\(ShellQuoting.singleQuote(newTmuxName))
+            fi
+            tmux set-option -t \"$session_name\" @ccsm_title \(ShellQuoting.singleQuote(title))
+        fi
+        printf '%s' \"$transcript\"
+        """
+        _ = try execute(command)
     }
 
     func killSession(named name: String) throws {
@@ -372,6 +673,7 @@ enum ClaudeHistoryAdapter {
         server: ServerProfile
     ) -> RemoteHistoryResult {
         var conversations: [String: Conversation] = [:]
+        var titleOverrides: [String: (title: String, source: ConversationTitleSource)] = [:]
         var malformedLines = 0
 
         for line in text.split(whereSeparator: \ .isNewline) {
@@ -383,6 +685,15 @@ enum ClaudeHistoryAdapter {
 
             let sessionID = stringValue(object, keys: ["sessionId", "session_id", "sessionID"])
             guard let sessionID, !sessionID.isEmpty else { continue }
+
+            let type = stringValue(object, keys: ["type"])
+            if let metadata = metadataTitle(object, type: type) {
+                let shouldReplace = metadata.source == .custom || titleOverrides[sessionID] == nil
+                if shouldReplace {
+                    titleOverrides[sessionID] = metadata
+                }
+                continue
+            }
 
             let display = stringValue(object, keys: ["display", "title", "summary", "prompt"])
                 ?? messageText(object["message"])
@@ -398,6 +709,7 @@ enum ClaudeHistoryAdapter {
                 sessionID: sessionID,
                 projectPath: project,
                 title: title,
+                titleSource: .inferred,
                 updatedAt: timestamp,
                 source: server.historyPath
             )
@@ -411,6 +723,13 @@ enum ClaudeHistoryAdapter {
             } else {
                 conversations[sessionID] = candidate
             }
+        }
+
+        for (sessionID, override) in titleOverrides {
+            guard var conversation = conversations[sessionID] else { continue }
+            conversation.title = override.title
+            conversation.titleSource = override.source
+            conversations[sessionID] = conversation
         }
 
         let result = conversations.values.sorted {
@@ -427,6 +746,21 @@ enum ClaudeHistoryAdapter {
         return RemoteHistoryResult(conversations: result, warning: warning)
     }
 
+    static func applyTitleOverrides(
+        from text: String,
+        to conversations: [Conversation]
+    ) -> [Conversation] {
+        let overrides = titleOverrides(from: text)
+        guard !overrides.isEmpty else { return conversations }
+        return conversations.map { conversation in
+            guard let override = overrides[conversation.sessionID] else { return conversation }
+            var updated = conversation
+            updated.title = override.title
+            updated.titleSource = override.source
+            return updated
+        }
+    }
+
     static func merge(
         cached: [Conversation],
         incremental: [Conversation]
@@ -439,13 +773,56 @@ enum ClaudeHistoryAdapter {
             }
             let previousDate = previous.updatedAt ?? .distantPast
             let newDate = conversation.updatedAt ?? .distantPast
-            if newDate >= previousDate || previous.title == "未命名对话" {
+            if conversation.titleSource == .custom
+                || (previous.titleSource != .custom && (newDate >= previousDate || previous.title == "未命名对话")) {
                 bySession[conversation.sessionID] = conversation
             }
         }
         return bySession.values.sorted {
             ($0.updatedAt ?? .distantPast) > ($1.updatedAt ?? .distantPast)
         }
+    }
+
+    private static func titleOverrides(
+        from text: String
+    ) -> [String: (title: String, source: ConversationTitleSource)] {
+        var overrides: [String: (title: String, source: ConversationTitleSource)] = [:]
+        for line in text.split(whereSeparator: \ .isNewline) {
+            guard let data = String(line).data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let sessionID = stringValue(object, keys: ["sessionId", "session_id", "sessionID"]),
+                  let metadata = metadataTitle(object, type: stringValue(object, keys: ["type"])) else {
+                continue
+            }
+            if metadata.source == .custom || overrides[sessionID] == nil {
+                overrides[sessionID] = metadata
+            }
+        }
+        return overrides
+    }
+
+    private static func metadataTitle(
+        _ object: [String: Any],
+        type: String?
+    ) -> (title: String, source: ConversationTitleSource)? {
+        let normalizedType = type?.lowercased()
+        let keys: [String]
+        let source: ConversationTitleSource
+        switch normalizedType {
+        case "custom-title":
+            keys = ["customTitle", "custom_title", "title", "display"]
+            source = .custom
+        case "ai-title":
+            keys = ["aiTitle", "ai_title", "title", "display"]
+            source = .inferred
+        case "agent-name":
+            keys = ["agentName", "agent_name", "name", "title", "display"]
+            source = .inferred
+        default:
+            return nil
+        }
+        guard let title = normalizedTitle(stringValue(object, keys: keys)) else { return nil }
+        return (title, source)
     }
 
     private static func stringValue(_ object: [String: Any], keys: [String]) -> String? {
@@ -498,7 +875,7 @@ enum ClaudeHistoryAdapter {
         return nil
     }
 
-    private static func normalizedTitle(_ value: String?) -> String? {
+    static func normalizedTitle(_ value: String?) -> String? {
         guard let value else { return nil }
         let title = value
             .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
@@ -576,6 +953,8 @@ final class AppState: ObservableObject {
     @Published var statusMessage: String?
     @Published var lastError: String?
     @Published var showingAddServer = false
+    @Published var showingNewConversation = false
+    @Published var renameTarget: Conversation?
 
     private let ghostty = GhosttyBridge()
     private var historyCache: [UUID: HistoryCacheEntry] = LocalStore.loadHistoryCache()
@@ -589,6 +968,11 @@ final class AppState: ObservableObject {
     var selectedServer: ServerProfile? {
         guard let selectedServerID else { return nil }
         return servers.first(where: { $0.id == selectedServerID })
+    }
+
+    var selectedConversation: Conversation? {
+        guard let selectedConversationID else { return nil }
+        return conversations.first(where: { $0.id == selectedConversationID })
     }
 
     var filteredConversations: [Conversation] {
@@ -612,8 +996,113 @@ final class AppState: ObservableObject {
         return activeSessions.filter { $0.serverID == selectedServerID }
     }
 
+    func conversation(for session: ActiveSession) -> Conversation? {
+        conversations.first { conversation in
+            isManagedSession(session, for: conversation)
+        }
+    }
+
+    func isManagedSession(_ session: ActiveSession, for conversation: Conversation) -> Bool {
+        let names = [
+            conversation.tmuxName,
+            conversation.legacyTmuxName,
+            Conversation.stableTmuxName(forSessionID: conversation.sessionID)
+        ] + servers.map {
+            Conversation.legacyTmuxName(
+                serverID: $0.id,
+                sshTarget: $0.sshTarget,
+                projectPath: conversation.projectPath,
+                sessionID: conversation.sessionID
+            )
+        }
+        return names.contains(session.name)
+            || (session.sessionID == conversation.sessionID && session.sessionID != nil)
+    }
+
     func title(for session: ActiveSession) -> String {
-        conversations.first(where: { $0.tmuxName == session.name })?.title ?? session.name
+        conversation(for: session)?.title ?? session.title ?? session.name
+    }
+
+    func beginRename(_ conversation: Conversation) {
+        renameTarget = conversation
+    }
+
+    func rename(_ conversation: Conversation, to rawTitle: String) {
+        guard let title = ClaudeHistoryAdapter.normalizedTitle(rawTitle) else {
+            lastError = "聊天标题不能为空"
+            return
+        }
+        statusMessage = "正在重命名聊天…"
+        lastError = nil
+        Task {
+            do {
+                guard let server = servers.first(where: { $0.id == conversation.serverID }) else {
+                    throw SSHError.commandFailed("找不到服务器配置")
+                }
+                try await Task.detached(priority: .userInitiated) {
+                    try SSHClient(server: server).renameConversation(conversation, to: title)
+                }.value
+                let renamed = conversation.renamed(to: title)
+                replaceConversation(renamed)
+                statusMessage = "已重命名：\(title)"
+                await refreshSelectedServer()
+            } catch {
+                lastError = error.localizedDescription
+                statusMessage = nil
+            }
+        }
+    }
+
+    func startNewConversation(title rawTitle: String?, projectPath rawProjectPath: String) {
+        guard let server = selectedServer else {
+            lastError = "请先选择服务器"
+            return
+        }
+        let title = rawTitle.flatMap(ClaudeHistoryAdapter.normalizedTitle)
+        let projectPath = rawProjectPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "~"
+            : rawProjectPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let sessionID = UUID().uuidString.lowercased()
+        statusMessage = "正在创建新的 Claude 会话…"
+        lastError = nil
+        Task {
+            do {
+                let tmuxName = try await Task.detached(priority: .userInitiated) {
+                    try SSHClient(server: server).startSession(
+                        sessionID: sessionID,
+                        title: title,
+                        projectPath: projectPath
+                    )
+                }.value
+                if let title {
+                    let newConversation = Conversation(
+                        id: "\(server.id.uuidString):\(sessionID)",
+                        serverID: server.id,
+                        serverName: server.name,
+                        sshTarget: server.sshTarget,
+                        sessionID: sessionID,
+                        projectPath: projectPath,
+                        title: title,
+                        titleSource: .custom,
+                        updatedAt: Date(),
+                        source: server.historyPath
+                    )
+                    try await Task.detached(priority: .userInitiated) {
+                        try SSHClient(server: server).renameConversation(newConversation, to: title)
+                    }.value
+                }
+                try ghostty.openAttachTab(
+                    server: server,
+                    tmuxName: tmuxName,
+                    title: title ?? "新建 Claude 对话"
+                )
+                statusMessage = title.map { "已在 Ghostty 中打开：\($0)" } ?? "已在 Ghostty 中打开新对话"
+                await refreshSelectedServer()
+            } catch {
+                lastError = error.localizedDescription
+                statusMessage = nil
+            }
+        }
     }
 
     func addServer(_ server: ServerProfile) {
@@ -678,13 +1167,13 @@ final class AppState: ObservableObject {
             do {
                 let client = SSHClient(server: server)
                 let signature = try client.historySignature()
-                let conversations: [Conversation]
+                let parsedConversations: [Conversation]
                 let warning: String?
 
                 if let signature,
                    let cachedEntry,
                    cachedEntry.signature == signature {
-                    conversations = cachedEntry.conversations
+                    parsedConversations = cachedEntry.conversations
                     warning = cachedEntry.warning
                 } else if let signature,
                           let cachedEntry,
@@ -693,14 +1182,17 @@ final class AppState: ObservableObject {
                           signature.modifiedAt >= cachedSignature.modifiedAt {
                     let suffix = try client.readHistoryAppending(fromByteOffset: cachedEntry.byteOffset)
                     let parsed = ClaudeHistoryAdapter.parse(text: suffix, server: server)
-                    conversations = ClaudeHistoryAdapter.merge(cached: cachedEntry.conversations, incremental: parsed.conversations)
+                    parsedConversations = ClaudeHistoryAdapter.merge(cached: cachedEntry.conversations, incremental: parsed.conversations)
                     warning = parsed.warning
                 } else {
                     let history = try client.readHistory()
                     let parsed = ClaudeHistoryAdapter.parse(text: history, server: server)
-                    conversations = parsed.conversations
+                    parsedConversations = parsed.conversations
                     warning = parsed.warning
                 }
+
+                let metadata = (try? client.readSessionMetadata(for: parsedConversations.map(\.sessionID))) ?? ""
+                let conversations = ClaudeHistoryAdapter.applyTitleOverrides(from: metadata, to: parsedConversations)
 
                 let currentSignature = try client.historySignature() ?? signature
                 let cache = HistoryCacheEntry(
@@ -732,7 +1224,8 @@ final class AppState: ObservableObject {
         conversations = result.conversations.sorted {
             ($0.updatedAt ?? .distantPast) > ($1.updatedAt ?? .distantPast)
         }
-        activeSessions = result.sessions
+        let reconciled = reconcileActiveSessions(result.sessions, conversations: conversations)
+        activeSessions = reconciled.sessions
         isLoading = false
         if let cache = result.cache {
             historyCache[server.id] = cache
@@ -743,7 +1236,11 @@ final class AppState: ObservableObject {
             lastError = "\(server.name)：\(error)"
         } else {
             statusMessage = "已更新 \(server.name)：\(conversations.count) 个对话，\(activeSessions.count) 个活跃会话"
-            lastError = result.warning
+            if reconciled.duplicateCount > 0 {
+                lastError = "检测到 \(reconciled.duplicateCount) 个重复 tmux 连接，已全部列出；请保留一个并结束其余旧会话。"
+            } else {
+                lastError = result.warning
+            }
         }
     }
 
@@ -755,10 +1252,21 @@ final class AppState: ObservableObject {
                 guard let server = servers.first(where: { $0.id == conversation.serverID }) else {
                     throw SSHError.commandFailed("找不到服务器配置")
                 }
-                try await Task.detached(priority: .userInitiated) {
-                    try SSHClient(server: server).ensureSession(for: conversation)
+                let legacyNames = servers.map {
+                    Conversation.legacyTmuxName(
+                        serverID: $0.id,
+                        sshTarget: $0.sshTarget,
+                        projectPath: conversation.projectPath,
+                        sessionID: conversation.sessionID
+                    )
+                }
+                let tmuxName = try await Task.detached(priority: .userInitiated) {
+                    try SSHClient(server: server).ensureSession(
+                        for: conversation,
+                        additionalLegacyNames: legacyNames
+                    )
                 }.value
-                try ghostty.openAttachTab(server: server, tmuxName: conversation.tmuxName, title: conversation.title)
+                try ghostty.openAttachTab(server: server, tmuxName: tmuxName, title: conversation.title)
                 selectedConversationID = conversation.id
                 statusMessage = "已在 Ghostty 中打开：\(conversation.title)"
                 await refreshSelectedServer()
@@ -772,9 +1280,9 @@ final class AppState: ObservableObject {
     func attach(_ session: ActiveSession) {
         guard let server = selectedServer else { return }
         do {
-            let title = conversations.first(where: { $0.tmuxName == session.name })?.title ?? session.name
+            let title = title(for: session)
             try ghostty.openAttachTab(server: server, tmuxName: session.name, title: title)
-            statusMessage = "已重新连接 \(session.name)"
+            statusMessage = "已重新连接 \(title)"
         } catch {
             lastError = error.localizedDescription
         }
@@ -802,6 +1310,41 @@ final class AppState: ObservableObject {
             lastError = "保存服务器配置失败：\(error.localizedDescription)"
         }
     }
+
+    private func replaceConversation(_ conversation: Conversation) {
+        guard let index = conversations.firstIndex(where: { $0.id == conversation.id }) else { return }
+        conversations[index] = conversation
+        guard let serverID = selectedServerID,
+              var cache = historyCache[serverID] else { return }
+        cache = HistoryCacheEntry(
+            signature: cache.signature,
+            byteOffset: cache.byteOffset,
+            conversations: cache.conversations.map { $0.id == conversation.id ? conversation : $0 },
+            warning: cache.warning
+        )
+        historyCache[serverID] = cache
+        try? LocalStore.saveHistoryCache(historyCache)
+    }
+
+    private func reconcileActiveSessions(
+        _ sessions: [ActiveSession],
+        conversations: [Conversation]
+    ) -> (sessions: [ActiveSession], duplicateCount: Int) {
+        var groups: [String: [ActiveSession]] = [:]
+        for session in sessions {
+            if let sessionID = session.sessionID {
+                groups["session:\(sessionID)", default: []].append(session)
+            } else if let conversation = conversations.first(where: { isManagedSession(session, for: $0) }) {
+                groups["session:\(conversation.sessionID)", default: []].append(session)
+            }
+        }
+        let duplicateCount = groups.values.reduce(into: 0) { count, group in
+            count += max(0, group.count - 1)
+        }
+        // Keep every duplicate visible so the user can identify and end stale
+        // sessions left by an older app version or a previous race.
+        return (sessions.sorted { $0.created < $1.created }, duplicateCount)
+    }
 }
 
 // MARK: - Views
@@ -824,6 +1367,14 @@ struct ContentView: View {
         }
         .sheet(isPresented: $state.showingAddServer) {
             AddServerView()
+                .environmentObject(state)
+        }
+        .sheet(isPresented: $state.showingNewConversation) {
+            NewConversationView(defaultProjectPath: state.selectedConversation?.projectPath ?? "~")
+                .environmentObject(state)
+        }
+        .sheet(item: $state.renameTarget) { conversation in
+            RenameConversationView(conversation: conversation)
                 .environmentObject(state)
         }
         .alert("连接或操作失败", isPresented: Binding(
@@ -879,13 +1430,28 @@ struct SidebarView: View {
                                     Text(session.attachedClients > 0 ? "已连接" : "后台运行")
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
+                                    Text(session.name)
+                                        .font(.caption2.monospaced())
+                                        .foregroundStyle(.tertiary)
                                 }
                                 Spacer()
+                                if let conversation = state.conversation(for: session) {
+                                    Button {
+                                        state.beginRename(conversation)
+                                    } label: {
+                                        Image(systemName: "pencil")
+                                    }
+                                    .buttonStyle(.borderless)
+                                    .help("重命名聊天")
+                                }
                             }
                             .contentShape(Rectangle())
                             .onTapGesture { state.attach(session) }
                             .contextMenu {
                                 Button("进入") { state.attach(session) }
+                                if let conversation = state.conversation(for: session) {
+                                    Button("重命名") { state.beginRename(conversation) }
+                                }
                                 Button("结束会话", role: .destructive) { state.end(session) }
                             }
                         }
@@ -937,6 +1503,12 @@ struct ConversationView: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
+                Button {
+                    state.showingNewConversation = true
+                } label: {
+                    Label("新建对话", systemImage: "plus.bubble")
+                }
+                .disabled(state.selectedServer == nil || state.isLoading)
                 if state.isLoading {
                     ProgressView()
                         .controlSize(.small)
@@ -960,6 +1532,7 @@ struct ConversationView: View {
                             .tag(conversation.id)
                             .contextMenu {
                                 Button("打开") { state.open(conversation) }
+                                Button("重命名") { state.beginRename(conversation) }
                             }
                     }
                 }
@@ -998,7 +1571,7 @@ struct ConversationRow: View {
     @EnvironmentObject private var state: AppState
 
     var isActive: Bool {
-        state.activeSessions.contains { $0.name == conversation.tmuxName }
+        state.activeSessions.contains { state.isManagedSession($0, for: conversation) }
     }
 
     var body: some View {
@@ -1025,6 +1598,13 @@ struct ConversationRow: View {
             }
             Spacer()
             Button {
+                state.beginRename(conversation)
+            } label: {
+                Image(systemName: "pencil")
+            }
+            .buttonStyle(.borderless)
+            .help("重命名聊天")
+            Button {
                 state.open(conversation)
             } label: {
                 Image(systemName: "arrow.up.right.square")
@@ -1033,6 +1613,83 @@ struct ConversationRow: View {
             .help(isActive ? "重新进入 tmux 会话" : "创建并打开 tmux 会话")
         }
         .padding(.vertical, 6)
+    }
+}
+
+struct RenameConversationView: View {
+    let conversation: Conversation
+    @EnvironmentObject private var state: AppState
+    @Environment(\.dismiss) private var dismiss
+    @StateObject private var form: RenameConversationForm
+
+    init(conversation: Conversation) {
+        self.conversation = conversation
+        _form = StateObject(wrappedValue: RenameConversationForm(title: conversation.title))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text("重命名聊天")
+                .font(.title2.weight(.semibold))
+            Text("标题会写入 Claude Code 的 session 记录，并同步活跃 tmux 的显示名称。")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+            TextField("聊天标题", text: $form.title)
+                .textFieldStyle(.roundedBorder)
+
+            HStack {
+                Spacer()
+                Button("取消") { dismiss() }
+                Button("保存") {
+                    state.rename(conversation, to: form.title)
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(ClaudeHistoryAdapter.normalizedTitle(form.title) == nil)
+            }
+        }
+        .padding(24)
+        .frame(width: 470)
+    }
+}
+
+struct NewConversationView: View {
+    let defaultProjectPath: String
+    @EnvironmentObject private var state: AppState
+    @Environment(\.dismiss) private var dismiss
+    @StateObject private var form: NewConversationForm
+
+    init(defaultProjectPath: String) {
+        self.defaultProjectPath = defaultProjectPath
+        _form = StateObject(wrappedValue: NewConversationForm(projectPath: defaultProjectPath))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text("新建 Claude 对话")
+                .font(.title2.weight(.semibold))
+            Text("会在当前服务器创建一个新的持久 tmux 会话，并在 Ghostty 中打开。标题留空时由 Claude Code 自动生成。")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+
+            Form {
+                TextField("标题（可选）", text: $form.title)
+                TextField("项目路径", text: $form.projectPath)
+                    .help("可以填写远程绝对路径，或使用 ~ 表示远程用户主目录")
+            }
+
+            HStack {
+                Spacer()
+                Button("取消") { dismiss() }
+                Button("创建并打开") {
+                    state.startNewConversation(title: form.title, projectPath: form.projectPath)
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(24)
+        .frame(width: 500)
     }
 }
 
@@ -1082,6 +1739,25 @@ final class AddServerForm: ObservableObject {
     @Published var name = ""
     @Published var sshTarget = ""
     @Published var historyPath = "~/.claude/history.jsonl"
+}
+
+@MainActor
+final class RenameConversationForm: ObservableObject {
+    @Published var title: String
+
+    init(title: String) {
+        self.title = title
+    }
+}
+
+@MainActor
+final class NewConversationForm: ObservableObject {
+    @Published var title = ""
+    @Published var projectPath: String
+
+    init(projectPath: String) {
+        self.projectPath = projectPath
+    }
 }
 
 @main
