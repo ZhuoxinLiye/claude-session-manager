@@ -95,6 +95,7 @@ Issues and pull requests are welcome. Please include the macOS version, Swift ve
 - The exact Claude Code version on each server may require a small adapter adjustment.
 - Ghostty automation is currently implemented through its scripting dictionary. The app prefers an existing matching tab, otherwise creates a tab in the front window and falls back to a new window when Ghostty has no open window.
 - Title editing writes Claude Code's JSONL transcript event directly. This is the format used by Claude Code today; a future Claude Code release could change its internal event schema.
+- If a user manually replaces a managed tab's title through another Ghostty action, the invisible association marker is removed; opening that conversation from the app once restores the marker.
 - mosh transport is reserved for a later iteration; the current MVP uses OpenSSH plus tmux.
 
 ## License
