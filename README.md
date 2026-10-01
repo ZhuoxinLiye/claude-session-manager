@@ -83,7 +83,7 @@ Older releases used a hash of the local server profile ID, SSH target, project p
 
 If duplicate sessions already exist, the refresh warning lists every duplicate so that the stale entry can be ended from the active tmux panel. The app does not automatically kill a session because it cannot infer which attached terminal the user wants to keep. A duplicate without `@ccsm_session_id` may come from an older app release or from a manually created `cc-*` tmux session and has to be inspected before ending.
 
-Ghostty tabs created before the session marker was introduced do not carry the marker. When there is no marker, the app reuses the first tab whose visible title exactly matches the conversation title; opening a new tab is fully deterministic for tabs created by the current release.
+Ghostty tabs created before the session marker was introduced do not carry the marker. When there is no marker, the app reuses only an unambiguous tab whose visible title exactly matches the conversation title; if several tabs have that title, it creates a new marked tab rather than guessing which session to select.
 
 ## Contributing
 

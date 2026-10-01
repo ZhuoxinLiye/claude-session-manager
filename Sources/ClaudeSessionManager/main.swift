@@ -949,19 +949,25 @@ struct GhosttyBridge {
             end repeat
 
             -- Tabs created by versions before the marker was introduced only have the
-            -- visible title. Reuse the first exact match as a compatibility fallback.
+            -- visible title. Reuse an unambiguous exact match as a compatibility fallback.
+            set exactTitleCount to 0
+            set exactTitleTab to missing value
             repeat with windowItem in windows
                 repeat with tabItem in tabs of windowItem
                     try
                         if (name of tabItem) is \(visibleTitleLiteral) then
-                            select tab tabItem
-                            focus (focused terminal of tabItem)
-                            perform action \(appleScriptString(action)) on focused terminal of tabItem
-                            return "reused"
+                            set exactTitleCount to exactTitleCount + 1
+                            set exactTitleTab to tabItem
                         end if
                     end try
                 end repeat
             end repeat
+            if exactTitleCount is 1 then
+                select tab exactTitleTab
+                focus (focused terminal of exactTitleTab)
+                perform action \(appleScriptString(action)) on focused terminal of exactTitleTab
+                return "reused"
+            end if
 
             set configuration to new surface configuration
             set command of configuration to \(appleScriptString(command))
