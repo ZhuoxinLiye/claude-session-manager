@@ -633,6 +633,10 @@ struct SSHClient {
         let command = "cd -- \(project) && exec ${SHELL:-/bin/sh} -lic \(ShellQuoting.singleQuote(launch))"
         let quotedCommand = ShellQuoting.singleQuote(command)
         let titleOption = title.map(ShellQuoting.singleQuote) ?? "''"
+        let titleLookup = title.map(ShellQuoting.singleQuote) ?? "''"
+        let titleMatch = title == nil
+            ? "0"
+            : "$3 == \"claude\" && ($2 == title || $2 == \"✳ \" title)"
         let lock = ShellQuoting.singleQuote(Conversation.lockName(forSessionID: sessionID))
         let expectedID = ShellQuoting.singleQuote(sessionID)
         let legacyCase = legacyNames
@@ -672,13 +676,30 @@ struct SSHClient {
             fi
         fi
         if ! tmux has-session -t \"$session_name\" 2>/dev/null; then
-            existing=$(tmux list-sessions -F '#{session_name}\\t#{@ccsm_session_id}' 2>/dev/null | awk -F '\\t' -v id=\(ShellQuoting.singleQuote(sessionID)) '$2 == id {print $1; exit}')
+            existing=$(tmux list-sessions -F '#{session_name}\t#{@ccsm_session_id}' 2>/dev/null | awk -F '\t' -v id=\(ShellQuoting.singleQuote(sessionID)) '$2 == id {print $1; exit}')
             if [ -n \"$existing\" ]; then
                 tmux rename-session -t \"$existing\" \"$session_name\" 2>/dev/null || session_name=\"$existing\"
             else
                 \(legacyLookupCommand)
                 if ! tmux has-session -t \"$session_name\" 2>/dev/null; then
-                    tmux new-session -d -s \"$session_name\" \(quotedCommand) 2>/dev/null || tmux has-session -t \"$session_name\" 2>/dev/null || exit 1
+                    # Older app versions did not install the SessionStart hook. Claude
+                    # still exposes its current display title as the tmux pane title,
+                    # so reuse one unambiguous Claude pane after /resume or /new.
+                    pane_matches=$(tmux list-panes -a -F '#{session_name}\t#{pane_title}\t#{pane_current_command}' 2>/dev/null | awk -F '\t' -v title=\(titleLookup) '\(titleMatch) {print $1}')
+                    pane_count=$(printf '%s\\n' \"$pane_matches\" | awk 'NF {count++} END {print count + 0}')
+                    if [ \"$pane_count\" -gt 1 ]; then
+                        printf '多个活跃 Claude pane 使用了相同标题，无法安全判断要复用哪个 tmux：%s\\n' \(titleOption) >&2
+                        exit 18
+                    elif [ \"$pane_count\" -eq 1 ]; then
+                        existing=$(printf '%s\\n' \"$pane_matches\" | awk 'NF {print; exit}')
+                        current_id=$(tmux display-message -p -t \"$existing\" '#{@ccsm_session_id}' 2>/dev/null || true)
+                        if [ -n \"$current_id\" ] && [ \"$current_id\" != \"$expected_id\" ]; then
+                            tmux set-option -t \"$existing\" @ccsm_previous_session_id \"$current_id\" 2>/dev/null || true
+                        fi
+                        tmux rename-session -t \"$existing\" \"$session_name\" 2>/dev/null || session_name=\"$existing\"
+                    else
+                        tmux new-session -d -s \"$session_name\" \(quotedCommand) 2>/dev/null || tmux has-session -t \"$session_name\" 2>/dev/null || exit 1
+                    fi
                 fi
             fi
         fi
@@ -723,7 +744,7 @@ struct SSHClient {
             exit 3
         fi
         printf '%s\\n' \(quotedLine) >> \"$transcript\"
-        existing=$(tmux list-sessions -F '#{session_name}\\t#{@ccsm_session_id}' 2>/dev/null | awk -F '\\t' -v id=\(ShellQuoting.singleQuote(conversation.sessionID)) '$2 == id {print $1; exit}')
+        existing=$(tmux list-sessions -F '#{session_name}\t#{@ccsm_session_id}' 2>/dev/null | awk -F '\t' -v id=\(ShellQuoting.singleQuote(conversation.sessionID)) '$2 == id {print $1; exit}')
         if [ -n \"$existing\" ]; then
             session_name=\"$existing\"
             if tmux rename-session -t \"$session_name\" \(ShellQuoting.singleQuote(newTmuxName)) 2>/dev/null; then
