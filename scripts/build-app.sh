@@ -42,6 +42,11 @@ cat > "$app_dir/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
+# Finder metadata inherited from a synced workspace can make a signed app fail
+# strict verification as a resource fork. It is not part of the bundle.
+if command -v xattr >/dev/null 2>&1; then
+    xattr -cr "$app_dir" 2>/dev/null || true
+fi
 /usr/bin/codesign --force --sign - "$app_dir"
 
 echo "Built $app_dir"
