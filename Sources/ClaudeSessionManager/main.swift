@@ -233,6 +233,25 @@ enum LocalStore {
         directoryURL.appendingPathComponent("history-cache.json")
     }
 
+    private static var directoryBookmarksURL: URL {
+        directoryURL.appendingPathComponent("directory-bookmarks.json")
+    }
+
+    static func loadDirectoryBookmarks() -> [String: [String]] {
+        guard let data = try? Data(contentsOf: directoryBookmarksURL),
+              let bookmarks = try? JSONDecoder().decode([String: [String]].self, from: data) else {
+            return [:]
+        }
+        return bookmarks
+    }
+
+    static func saveDirectoryBookmarks(_ bookmarks: [String: [String]]) throws {
+        try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(bookmarks).write(to: directoryBookmarksURL, options: .atomic)
+    }
+
     static func loadServers() -> [ServerProfile] {
         guard let data = try? Data(contentsOf: serversURL),
               let servers = try? JSONDecoder().decode([ServerProfile].self, from: data) else {
@@ -1089,6 +1108,7 @@ final class AppState: ObservableObject {
     @Published var showingAddServer = false
     @Published var showingNewConversation = false
     @Published var renameTarget: Conversation?
+    @Published private(set) var directoryBookmarks = LocalStore.loadDirectoryBookmarks()
 
     private let ghostty = GhosttyBridge()
     private var historyCache: [UUID: HistoryCacheEntry] = LocalStore.loadHistoryCache()
@@ -1161,6 +1181,23 @@ final class AppState: ObservableObject {
         renameTarget = conversation
     }
 
+    func bookmarkedDirectories(for server: ServerProfile) -> [String] {
+        directoryBookmarks[server.sshTarget] ?? []
+    }
+
+    func toggleDirectoryBookmark(_ path: String, for server: ServerProfile) throws {
+        var updated = directoryBookmarks
+        var paths = updated[server.sshTarget] ?? []
+        if paths.contains(path) {
+            paths.removeAll { $0 == path }
+        } else {
+            paths.append(path)
+        }
+        updated[server.sshTarget] = paths
+        try LocalStore.saveDirectoryBookmarks(updated)
+        directoryBookmarks = updated
+    }
+
     func rename(_ conversation: Conversation, to rawTitle: String) {
         guard let title = ClaudeHistoryAdapter.normalizedTitle(rawTitle) else {
             lastError = "聊天标题不能为空"
@@ -1192,15 +1229,13 @@ final class AppState: ObservableObject {
         }
     }
 
-    func startNewConversation(title rawTitle: String?, projectPath rawProjectPath: String) {
-        guard let server = selectedServer else {
-            lastError = "请先选择服务器"
-            return
-        }
+    func startNewConversation(
+        title rawTitle: String?,
+        projectPath rawProjectPath: String,
+        on server: ServerProfile
+    ) {
         let title = rawTitle.flatMap(ClaudeHistoryAdapter.normalizedTitle)
-        let projectPath = rawProjectPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? "~"
-            : rawProjectPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        let projectPath = rawProjectPath.isEmpty ? "~" : rawProjectPath
         let sessionID = UUID().uuidString.lowercased()
         statusMessage = "正在创建新的 Claude 会话…"
         lastError = nil
@@ -1529,8 +1564,13 @@ struct ContentView: View {
                 .environmentObject(state)
         }
         .sheet(isPresented: $state.showingNewConversation) {
-            NewConversationView(defaultProjectPath: state.selectedConversation?.projectPath ?? "~")
+            if let server = state.selectedServer {
+                NewConversationView(
+                    server: server,
+                    defaultProjectPath: state.selectedConversation?.projectPath ?? "~"
+                )
                 .environmentObject(state)
+            }
         }
         .sheet(item: $state.renameTarget) { conversation in
             RenameConversationView(conversation: conversation)
@@ -1813,13 +1853,12 @@ struct RenameConversationView: View {
 }
 
 struct NewConversationView: View {
-    let defaultProjectPath: String
+    let server: ServerProfile
     @EnvironmentObject private var state: AppState
     @Environment(\.dismiss) private var dismiss
     @StateObject private var form: NewConversationForm
-
-    init(defaultProjectPath: String) {
-        self.defaultProjectPath = defaultProjectPath
+    init(server: ServerProfile, defaultProjectPath: String) {
+        self.server = server
         _form = StateObject(wrappedValue: NewConversationForm(projectPath: defaultProjectPath))
     }
 
@@ -1827,28 +1866,69 @@ struct NewConversationView: View {
         VStack(alignment: .leading, spacing: 18) {
             Text("新建 Claude 对话")
                 .font(.title2.weight(.semibold))
-            Text("会在当前服务器创建一个新的持久 tmux 会话，并在 Ghostty 中打开。标题留空时由 Claude Code 自动生成。")
+            Label(server.name, systemImage: "server.rack")
+                .font(.subheadline.weight(.medium))
+            Text("在选定项目目录创建持久 tmux 会话，并在 Ghostty 中打开。标题留空时由 Claude Code 自动生成。")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
 
-            Form {
-                TextField("标题（可选）", text: $form.title)
-                TextField("项目路径", text: $form.projectPath)
-                    .help("可以填写远程绝对路径，或使用 ~ 表示远程用户主目录")
+            VStack(alignment: .leading, spacing: 8) {
+                Text("标题（可选）")
+                    .font(.subheadline)
+                TextField("让 Claude Code 自动生成标题", text: $form.title)
+                    .textFieldStyle(.roundedBorder)
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("远程项目目录")
+                    .font(.subheadline)
+                HStack {
+                    TextField("~/projects/my-project", text: $form.projectPath)
+                        .textFieldStyle(.roundedBorder)
+                        .help("服务器上的目录，支持绝对路径和 ~/")
+                    Button {
+                        form.showingDirectoryPicker = true
+                    } label: {
+                        Label("浏览…", systemImage: "folder")
+                    }
+                    .keyboardShortcut("o", modifiers: [.command])
+                }
+                if !state.bookmarkedDirectories(for: server).isEmpty {
+                    Menu {
+                        ForEach(state.bookmarkedDirectories(for: server), id: \.self) { path in
+                            Button(path) { form.projectPath = path }
+                        }
+                        Divider()
+                        Button("管理收藏…") { form.showingDirectoryPicker = true }
+                    } label: {
+                        Label("收藏目录", systemImage: "star")
+                    }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                }
             }
 
             HStack {
                 Spacer()
                 Button("取消") { dismiss() }
                 Button("创建并打开") {
-                    state.startNewConversation(title: form.title, projectPath: form.projectPath)
+                    state.startNewConversation(
+                        title: form.title,
+                        projectPath: form.projectPath,
+                        on: server
+                    )
                     dismiss()
                 }
                 .keyboardShortcut(.defaultAction)
             }
         }
         .padding(24)
-        .frame(width: 500)
+        .frame(width: 560)
+        .sheet(isPresented: $form.showingDirectoryPicker) {
+            RemoteDirectoryPicker(server: server, initialPath: form.projectPath) { path in
+                form.projectPath = path
+            }
+        }
     }
 }
 
@@ -1913,6 +1993,7 @@ final class RenameConversationForm: ObservableObject {
 final class NewConversationForm: ObservableObject {
     @Published var title = ""
     @Published var projectPath: String
+    @Published var showingDirectoryPicker = false
 
     init(projectPath: String) {
         self.projectPath = projectPath

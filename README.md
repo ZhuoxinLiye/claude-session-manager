@@ -30,7 +30,7 @@ The project is macOS-first and intentionally uses the system OpenSSH client inst
 - The sidebar can reattach to active sessions or explicitly end them.
 - Active tmux entries use the matching Claude conversation title as their primary label. If the history no longer contains a session, the deterministic internal tmux name is shown as a fallback.
 - A pencil action or the conversation context menu changes a title. The app appends Claude Code's `custom-title` transcript event, updates the tmux title metadata and open Ghostty tab, and migrates the tmux name.
-- The current server view can create a new Claude session with an optional title and remote project path. New sessions use `claude --session-id` and an ASCII-safe `--name` seed, then append the exact app title as Claude's `custom-title` event before opening a new Ghostty tab.
+- The current server view can create a new Claude session with an optional title and remote project path. The directory field opens a remote, one-level-at-a-time browser with VS Code-style double-click navigation, path entry, hidden-directory filtering, and per-server bookmarks. New sessions use `claude --session-id` and an ASCII-safe `--name` seed, then append the exact app title as Claude's `custom-title` event before opening a new Ghostty tab.
 - Managed tmux sessions carry `@ccsm_session_id`, `@ccsm_project`, and `@ccsm_title` user options. These options let the app find a session by Claude session ID even after a title change or an SSH alias change.
 - Ships with a native macOS icon generated from the terminal conversation mark in `Resources/AppIcon.icns`.
 
@@ -71,6 +71,7 @@ The generated app bundle is written to `outputs/ClaudeSessionManager.app`. Build
 - `SSHClient` runs non-interactive inspection commands over OpenSSH and lists only the selected host.
 - `ClaudeHistoryAdapter` parses `~/.claude/history.jsonl`, with a fallback scan of `~/.claude/projects/**/*.jsonl`.
 - `LocalStore` caches history signatures and parsed conversations under `~/Library/Application Support/ClaudeSessionManager/`.
+- `RemoteDirectoryReader` lists only the selected directory's direct children over SSH; `directory-bookmarks.json` stores favorites locally, grouped by SSH target.
 - `GhosttyBridge` finds or creates a Ghostty tab and attaches to the managed tmux session for the selected conversation. Its session marker is derived from the Claude session ID, so title changes do not create another tab.
 
 No telemetry or cloud service is required. Remote history is fetched only after a host is selected or refreshed.
