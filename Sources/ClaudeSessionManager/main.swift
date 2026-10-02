@@ -187,6 +187,7 @@ struct ActiveSession: Identifiable, Hashable {
     let attachedClients: Int
     let created: String
     let sessionID: String?
+    let previousSessionID: String?
     let title: String?
 }
 
@@ -500,13 +501,22 @@ struct SSHClient {
     }
 
     func listSessions() throws -> [ActiveSession] {
-        let format = ShellQuoting.singleQuote("#{session_name}\t#{session_attached}\t#{session_created_string}\t#{@ccsm_session_id}\t#{@ccsm_title}")
+        let format = ShellQuoting.singleQuote("#{session_name}\t#{session_attached}\t#{session_created_string}\t#{@ccsm_session_id}\t#{@ccsm_previous_session_id}\t#{@ccsm_title}")
         let output = try execute("tmux list-sessions -F \(format) 2>/dev/null || true")
         return output
             .split(whereSeparator: \ .isNewline)
             .compactMap { line in
                 let fields = line.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
                 guard fields.count >= 5, fields[0].hasPrefix("cc-") else { return nil }
+                let previousSessionID: String?
+                let titleIndex: Int
+                if fields.count >= 6 {
+                    previousSessionID = fields[4].isEmpty ? nil : fields[4]
+                    titleIndex = 5
+                } else {
+                    previousSessionID = nil
+                    titleIndex = 4
+                }
                 return ActiveSession(
                     id: fields[0],
                     serverID: server.id,
@@ -515,7 +525,8 @@ struct SSHClient {
                     attachedClients: Int(fields[1]) ?? 0,
                     created: fields[2],
                     sessionID: fields[3].isEmpty ? nil : fields[3],
-                    title: fields[4].isEmpty ? nil : fields[4]
+                    previousSessionID: previousSessionID,
+                    title: fields.count > titleIndex && !fields[titleIndex].isEmpty ? fields[titleIndex] : nil
                 )
             }
     }
@@ -542,15 +553,16 @@ struct SSHClient {
     }
 
     private func resumeCommand(for conversation: Conversation) -> String {
-        "exec claude --resume \(ShellQuoting.singleQuote(conversation.sessionID))"
+        "exec claude --settings \(ShellQuoting.singleQuote(sessionTrackingSettings())) --resume \(ShellQuoting.singleQuote(conversation.sessionID))"
     }
 
     func startSession(sessionID: String, title: String?, projectPath: String) throws -> String {
         let launch: String
+        let settings = ShellQuoting.singleQuote(sessionTrackingSettings())
         if let title, let cliName = Conversation.claudeCLIName(for: title) {
-            launch = "exec claude --session-id \(ShellQuoting.singleQuote(sessionID)) --name \(ShellQuoting.singleQuote(cliName))"
+            launch = "exec claude --settings \(settings) --session-id \(ShellQuoting.singleQuote(sessionID)) --name \(ShellQuoting.singleQuote(cliName))"
         } else {
-            launch = "exec claude --session-id \(ShellQuoting.singleQuote(sessionID))"
+            launch = "exec claude --settings \(settings) --session-id \(ShellQuoting.singleQuote(sessionID))"
         }
         return try ensureManagedSession(
             name: title.map { Conversation.preferredTmuxName(title: $0, sessionID: sessionID) }
@@ -561,6 +573,51 @@ struct SSHClient {
             projectPath: projectPath,
             launch: launch
         )
+    }
+
+    private func sessionTrackingSettings() -> String {
+        // Claude Code sends the actual session ID to SessionStart hooks on startup,
+        // /resume, /clear, compaction, and fork. Store that ID in tmux so the app
+        // follows a session when the user switches conversations inside the tab.
+        let hookCommand = #"""
+        input=$(cat)
+        session_id=$(printf '%s' "$input" | sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+        case "$session_id" in
+            "") exit 0 ;;
+            *[!A-Za-z0-9_-]*) exit 0 ;;
+        esac
+        pane="${TMUX_PANE:-}"
+        [ -n "$pane" ] || exit 0
+        session_name=$(tmux display-message -p -t "$pane" '#{session_name}' 2>/dev/null || true)
+        [ -n "$session_name" ] || exit 0
+        old_id=$(tmux display-message -p -t "$session_name" '#{@ccsm_session_id}' 2>/dev/null || true)
+        if [ -n "$old_id" ] && [ "$old_id" != "$session_id" ]; then
+            tmux set-option -t "$session_name" @ccsm_previous_session_id "$old_id" 2>/dev/null || true
+        fi
+        tmux set-option -t "$session_name" @ccsm_session_id "$session_id" 2>/dev/null || true
+        tmux set-option -t "$session_name" @ccsm_project "$PWD" 2>/dev/null || true
+        exit 0
+        """#
+        let settings: [String: Any] = [
+            "hooks": [
+                "SessionStart": [
+                    [
+                        "hooks": [
+                            [
+                                "type": "command",
+                                "command": hookCommand,
+                                "timeout": 5
+                            ]
+                        ]
+                    ]
+                ]
+            ]
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: settings, options: [.sortedKeys]),
+              let result = String(data: data, encoding: .utf8) else {
+            return "{}"
+        }
+        return result
     }
 
     private func ensureManagedSession(
@@ -1083,6 +1140,47 @@ struct GhosttyBridge {
         return result.stdout.trimmingCharacters(in: .whitespacesAndNewlines) == "updated"
     }
 
+    @discardableResult
+    func rebindExistingTab(
+        from oldSessionID: String,
+        to newSessionID: String,
+        title: String
+    ) throws -> Bool {
+        guard !oldSessionID.isEmpty, !newSessionID.isEmpty, oldSessionID != newSessionID else {
+            return false
+        }
+        let cleanTitle = title
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let visibleTitle = String((cleanTitle.isEmpty ? "Claude 对话" : cleanTitle).prefix(80))
+        let oldMarkerLiteral = appleScriptString(tabMarker(for: "session:\(oldSessionID.lowercased())"))
+        let newMarker = tabMarker(for: "session:\(newSessionID.lowercased())")
+        let action = "set_tab_title:\(visibleTitle)\(newMarker)"
+        let script = """
+        tell application "Ghostty"
+            repeat with windowItem in windows
+                repeat with tabItem in tabs of windowItem
+                    try
+                        if (name of tabItem) contains \(oldMarkerLiteral) then
+                            select tab tabItem
+                            focus (focused terminal of tabItem)
+                            perform action \(appleScriptString(action)) on focused terminal of tabItem
+                            return "updated"
+                        end if
+                    end try
+                end repeat
+            end repeat
+            return "missing"
+        end tell
+        """
+        let result = try ProcessRunner.run("/usr/bin/osascript", arguments: ["-e", script])
+        guard result.status == 0 else {
+            let detail = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+            throw GhosttyBridgeError.unavailable(detail.isEmpty ? "无法更新 Ghostty tab 标题。" : detail)
+        }
+        return result.stdout.trimmingCharacters(in: .whitespacesAndNewlines) == "updated"
+    }
+
     private func appleScriptString(_ value: String) -> String {
         let escaped = value
             .replacingOccurrences(of: "\\", with: "\\\\")
@@ -1404,8 +1502,14 @@ final class AppState: ObservableObject {
         conversations = result.conversations.sorted {
             ($0.updatedAt ?? .distantPast) > ($1.updatedAt ?? .distantPast)
         }
+        let previousActiveSessions = activeSessions
         let reconciled = reconcileActiveSessions(result.sessions, conversations: conversations)
         activeSessions = reconciled.sessions
+        rebindChangedGhosttyTabs(
+            previous: previousActiveSessions,
+            current: reconciled.sessions,
+            conversations: conversations
+        )
         isLoading = false
         if let cache = result.cache {
             historyCache[server.id] = cache
@@ -1440,12 +1544,27 @@ final class AppState: ObservableObject {
                         sessionID: conversation.sessionID
                     )
                 }
-                let tmuxName = try await Task.detached(priority: .userInitiated) {
-                    try SSHClient(server: server).ensureSession(
+                let resolution = try await Task.detached(priority: .userInitiated) { () -> (name: String, before: [ActiveSession], after: [ActiveSession]) in
+                    let client = SSHClient(server: server)
+                    let before = (try? client.listSessions()) ?? []
+                    let name = try client.ensureSession(
                         for: conversation,
                         additionalLegacyNames: legacyNames
                     )
+                    let after = (try? client.listSessions()) ?? []
+                    return (name, before, after)
                 }.value
+                let tmuxName = resolution.name
+                let previousSessionID = resolution.after.first(where: { $0.name == tmuxName })?.previousSessionID
+                    ?? resolution.before.first(where: { $0.name == tmuxName })?.sessionID
+                if let previousSessionID,
+                   previousSessionID != conversation.sessionID {
+                    _ = try? ghostty.rebindExistingTab(
+                        from: previousSessionID,
+                        to: conversation.sessionID,
+                        title: conversation.title
+                    )
+                }
                 let tabResult = try ghostty.openAttachTab(
                     server: server,
                     tmuxName: tmuxName,
@@ -1538,6 +1657,28 @@ final class AppState: ObservableObject {
         // Keep every duplicate visible so the user can identify and end stale
         // sessions left by an older app version or a previous race.
         return (sessions.sorted { $0.created < $1.created }, duplicateCount)
+    }
+
+    private func rebindChangedGhosttyTabs(
+        previous: [ActiveSession],
+        current: [ActiveSession],
+        conversations: [Conversation]
+    ) {
+        let previousByName = Dictionary(uniqueKeysWithValues: previous.map { ($0.name, $0) })
+        for session in current {
+            guard let newSessionID = session.sessionID,
+                  let previousSessionID = session.previousSessionID
+                    ?? previousByName[session.name]?.sessionID,
+                  previousSessionID != newSessionID,
+                  let conversation = conversations.first(where: { $0.sessionID == newSessionID }) else {
+                continue
+            }
+            _ = try? ghostty.rebindExistingTab(
+                from: previousSessionID,
+                to: newSessionID,
+                title: conversation.title
+            )
+        }
     }
 }
 
