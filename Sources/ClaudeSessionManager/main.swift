@@ -108,18 +108,9 @@ struct Conversation: Identifiable, Hashable, Codable {
     }
 
     static func claudeCLIName(for title: String) -> String? {
-        let ascii = title.unicodeScalars.map { scalar -> Character in
-            if (scalar.value >= 48 && scalar.value <= 57)
-                || (scalar.value >= 65 && scalar.value <= 90)
-                || (scalar.value >= 97 && scalar.value <= 122)
-                || scalar.value == 45 || scalar.value == 95 {
-                return Character(String(scalar))
-            }
-            return "-"
-        }
-        let candidate = String(ascii)
-            .replacingOccurrences(of: "-+", with: "-", options: .regularExpression)
-            .trimmingCharacters(in: CharacterSet(charactersIn: "-_"))
+        let candidate = title
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !candidate.isEmpty else { return nil }
         return String(candidate.prefix(64))
     }
@@ -1367,23 +1358,6 @@ final class AppState: ObservableObject {
                         projectPath: projectPath
                     )
                 }.value
-                if let title {
-                    let newConversation = Conversation(
-                        id: "\(server.id.uuidString):\(sessionID)",
-                        serverID: server.id,
-                        serverName: server.name,
-                        sshTarget: server.sshTarget,
-                        sessionID: sessionID,
-                        projectPath: projectPath,
-                        title: title,
-                        titleSource: .custom,
-                        updatedAt: Date(),
-                        source: server.historyPath
-                    )
-                    try await Task.detached(priority: .userInitiated) {
-                        try SSHClient(server: server).renameConversation(newConversation, to: title)
-                    }.value
-                }
                 let tabResult = try ghostty.openAttachTab(
                     server: server,
                     tmuxName: tmuxName,
